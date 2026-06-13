@@ -1,0 +1,43 @@
+# LiteLLM gateway configuration
+general_settings:
+  num_retries: 3
+  request_timeout: 90
+  # Run without a database (no spend tracking / budget resets)
+  disable_spend_logs: true
+  disable_reset_budget: true
+  disable_error_logs: true
+  store_model_in_db: false
+
+router_settings:
+  routing_strategy: least-busy
+  allowed_fails: 2
+  cooldown_time: 30
+
+model_list:
+  # ── Gemini ─────────────────────────────────────────────────────────────────
+  - model_name: gemini/gemini-2.5-flash
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: "os.environ/GEMINI_API_KEY"
+
+  - model_name: gemini/gemini-2.0-flash
+    litellm_params:
+      model: gemini/gemini-2.0-flash-001
+      api_key: "os.environ/GEMINI_API_KEY"
+
+  - model_name: gemini/gemini-2.5-pro
+    litellm_params:
+      model: gemini/gemini-2.5-pro-preview-03-25
+      api_key: "os.environ/GEMINI_API_KEY"
+
+  # ── Anthropic ──────────────────────────────────────────────────────────────
+  - model_name: claude-3-7-sonnet-20250219
+    litellm_params:
+      model: anthropic/claude-3-7-sonnet-20250219
+      api_key: "os.environ/ANTHROPIC_API_KEY"
+
+  # ── OpenAI ─────────────────────────────────────────────────────────────────
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: "os.environ/OPENAI_API_KEY"

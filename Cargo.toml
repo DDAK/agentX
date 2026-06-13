@@ -1,0 +1,67 @@
+[package]
+name = "agentx"
+version = "0.1.0"
+edition = "2021"
+description = "A code-editing AI agent in Rust, powered by LiteLLM"
+
+[[bin]]
+name = "agentx"
+path = "src/main.rs"
+
+[lib]
+name = "agentx"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP / WebSocket API server
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tokio-tungstenite = { version = "0.26" }
+
+# HTTP client for LiteLLM gateway
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Async traits
+async-trait = "0.1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# UUID for session IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# Postgres
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+deadpool-postgres = { version = "0.14" }
+
+# Config from env
+dotenvy = "0.15"
+
+# Async channel / broadcast (for streaming agent events to WS clients)
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
+# Sandboxed Python interpreter — used by RunCodeTool to safely execute
+# agent-authored Python scripts with host-bridged tool functions.
+monty = { git = "https://github.com/pydantic/monty", package = "monty" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

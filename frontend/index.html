@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AgentX</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <!-- ── sidebar ─────────────────────────────────────────────────────────── -->
+  <aside id="sidebar">
+    <header class="sidebar-header">
+      <span class="logo">AgentX</span>
+      <button id="btn-new-session" title="New session">＋</button>
+    </header>
+
+    <div id="session-list-container">
+      <ul id="session-list"></ul>
+    </div>
+  </aside>
+
+  <!-- ── main chat area ──────────────────────────────────────────────────── -->
+  <main id="main">
+    <div id="connection-bar">
+      <span id="conn-status" class="status-dot disconnected"></span>
+      <span id="conn-label">Disconnected</span>
+      <span id="session-label-display"></span>
+    </div>
+
+    <div id="messages" role="log" aria-live="polite"></div>
+
+    <!-- typing indicator -->
+    <div id="typing-indicator" hidden>
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+    </div>
+
+    <!-- tool call sidebar strip -->
+    <div id="tool-strip" hidden></div>
+
+    <form id="input-form">
+      <textarea
+        id="message-input"
+        rows="1"
+        placeholder="Message AgentX… (Enter to send, Shift+Enter for newline)"
+        autocomplete="off"
+        spellcheck="true"
+      ></textarea>
+      <button type="submit" id="btn-send" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="22" y1="2" x2="11" y2="13"/>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+        </svg>
+      </button>
+    </form>
+  </main>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
