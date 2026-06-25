@@ -68,6 +68,16 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_owned(), Arc::new(tool));
     }
 
+    /// Register an already-boxed tool (e.g. MCP tools shared behind an `Arc`).
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.insert(tool.name().to_owned(), tool);
+    }
+
+    /// Whether a tool with this name is registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     /// Execute a named tool with the given JSON input.
     #[instrument(skip(self, input), fields(tool = %name))]
     pub async fn execute(&self, name: &str, input: Value) -> Result<String> {
@@ -445,21 +455,38 @@ impl Tool for RunCommandTool {
 
 // ── helper: build the default tool set ───────────────────────────────────────
 
-/// Build a `ToolRegistry` with all built-in tools pre-registered.
+/// Build a `ToolRegistry` with all built-in tools pre-registered (no MCP).
 ///
 /// The returned registry is wrapped in an `Arc` so it can be shared with
 /// `RunCodeTool`, which needs a reference back to the registry to dispatch
-/// host-function calls from inside the sandbox.
+/// host-function calls from inside the sandbox. Used by tests and as the
+/// convenience entry point when MCP is not configured.
+#[allow(dead_code)] // public helper used by integration tests
 pub fn default_registry(storage: Arc<dyn Storage>) -> Arc<ToolRegistry> {
+    default_registry_with_mcp(storage, &[])
+}
+
+/// Like [`default_registry`], plus any externally-supplied tools (e.g. tools
+/// discovered from MCP servers). MCP clients are connected once at startup and
+/// shared here behind `Arc`s, so this stays cheap to call per request.
+pub fn default_registry_with_mcp(
+    storage: Arc<dyn Storage>,
+    extra: &[Arc<dyn Tool>],
+) -> Arc<ToolRegistry> {
+    // Inner registry: the tools reachable from inside the run_code sandbox —
+    // the built-ins plus every MCP tool, so scripts can orchestrate MCP calls
+    // alongside file ops. (RunCodeTool itself is excluded to avoid recursion.)
     let mut registry = ToolRegistry::new();
     registry.register(ReadFileTool::new(Arc::clone(&storage)));
     registry.register(WriteFileTool::new(Arc::clone(&storage)));
     registry.register(EditFileTool::new(Arc::clone(&storage)));
     registry.register(ListFilesTool::new(Arc::clone(&storage)));
     registry.register(RunCommandTool);
+    for tool in extra {
+        registry.register_arc(Arc::clone(tool));
+    }
     let registry = Arc::new(registry);
-    // RunCodeTool holds a reference back to the registry so it can dispatch
-    // host calls from within the Monty sandbox.
+    // Outer registry: everything the model can call directly.
     let mut full = ToolRegistry::new();
     full.register(ReadFileTool::new(Arc::clone(&storage)));
     full.register(WriteFileTool::new(Arc::clone(&storage)));
@@ -467,5 +494,8 @@ pub fn default_registry(storage: Arc<dyn Storage>) -> Arc<ToolRegistry> {
     full.register(ListFilesTool::new(Arc::clone(&storage)));
     full.register(RunCommandTool);
     full.register(crate::code_tool::RunCodeTool::new(Arc::clone(&registry)));
+    for tool in extra {
+        full.register_arc(Arc::clone(tool));
+    }
     Arc::new(full)
 }

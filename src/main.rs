@@ -13,6 +13,8 @@ mod config;
 mod errors;
 mod hooks;
 mod llm;
+mod mcp;
+mod scripting;
 mod storage;
 mod tools;
 
@@ -30,7 +32,6 @@ use crate::errors::Result;
 use crate::hooks::{ConfirmCommandHook, HookChain, LoggingHook, ToolAnnouncerHook};
 use crate::llm::{LiteLlmClient, LiteLlmConfig};
 use crate::storage::{FilesystemStorage, PostgresStorage, Storage};
-use crate::tools::default_registry;
 
 #[tokio::main]
 async fn main() {
@@ -57,7 +58,15 @@ async fn main() {
 
 // ── shared bootstrap ──────────────────────────────────────────────────────────
 
-async fn bootstrap() -> Result<(Arc<dyn Storage>, Arc<LiteLlmClient>, Arc<AppConfig>)> {
+type Bootstrap = (
+    Arc<dyn Storage>,
+    Arc<LiteLlmClient>,
+    Arc<AppConfig>,
+    Vec<Arc<dyn tools::Tool>>,
+    AgentConfig,
+);
+
+async fn bootstrap() -> Result<Bootstrap> {
     let app_cfg = Arc::new(AppConfig::from_env()?);
     let llm_cfg = LiteLlmConfig::from_env()?;
 
@@ -77,17 +86,26 @@ async fn bootstrap() -> Result<(Arc<dyn Storage>, Arc<LiteLlmClient>, Arc<AppCon
         }
     };
 
+    // Load dynamic extensions (config.yaml, skills/*.md, commands/*.rhai).
+    let ext = crate::scripting::load_all(app_cfg.workspace_dir.clone());
+    let agent_cfg = ext.agent_config();
+
+    // Tools available to the agent: scripted commands + configured MCP servers.
+    // Both are shared across all sessions/requests behind Arcs.
+    let mut extra_tools = ext.commands;
+    extra_tools.extend(crate::mcp::connect_all().await);
+
     let llm = Arc::new(LiteLlmClient::new(llm_cfg));
-    Ok((storage, llm, app_cfg))
+    Ok((storage, llm, app_cfg, extra_tools, agent_cfg))
 }
 
 // ── server mode ───────────────────────────────────────────────────────────────
 
 async fn run_server() -> Result<()> {
-    let (storage, llm, app_cfg) = bootstrap().await?;
+    let (storage, llm, app_cfg, extra_tools, agent_cfg) = bootstrap().await?;
 
     let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
-    let router = build_router(storage, llm, app_cfg).await;
+    let router = build_router(storage, llm, app_cfg, extra_tools, agent_cfg).await;
 
     info!(addr = %bind, "HTTP server listening");
 
@@ -103,10 +121,10 @@ async fn run_server() -> Result<()> {
 // ── CLI mode ──────────────────────────────────────────────────────────────────
 
 async fn run_cli() -> Result<()> {
-    let (storage, llm, app_cfg) = bootstrap().await?;
+    let (storage, llm, app_cfg, extra_tools, agent_cfg) = bootstrap().await?;
 
     // Build tool registry + hooks.
-    let registry = default_registry(Arc::clone(&storage));
+    let registry = tools::default_registry_with_mcp(Arc::clone(&storage), &extra_tools);
     let mut hooks = HookChain::new();
     hooks.add(LoggingHook);
     hooks.add(ToolAnnouncerHook);
@@ -145,7 +163,9 @@ async fn run_cli() -> Result<()> {
                     let _ = std::io::stdout().flush();
                 }
                 AgentEvent::Text { text } => {
-                    println!("\x1b[93mAgentX\x1b[0m: {text}");
+                    use std::io::Write;
+                    print!("{text}");
+                    let _ = std::io::stdout().flush();
                 }
                 AgentEvent::ToolCall { name, input } => {
                     let compact = serde_json::to_string(&input).unwrap_or_default();
@@ -174,7 +194,7 @@ async fn run_cli() -> Result<()> {
     });
 
     // Task: run agent loop.
-    let agent = Agent::new(llm, registry, hooks, Arc::clone(&storage), AgentConfig::default());
+    let agent = Agent::new(llm, registry, hooks, Arc::clone(&storage), agent_cfg);
     let agent_task = tokio::spawn(async move {
         agent.run(&mut session, &mut rx_in, &tx_out_clone).await;
     });

@@ -40,16 +40,21 @@ use crate::errors::AgentError;
 use crate::hooks::{HookChain, LoggingHook, ToolAnnouncerHook};
 use crate::llm::LiteLlmClient;
 use crate::storage::{Session, Storage};
-use crate::tools::default_registry;
+use crate::tools::{default_registry_with_mcp, Tool};
 
 // ── shared application state ──────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct AppState {
-    pub storage: Arc<dyn Storage>,
-    pub llm:     Arc<LiteLlmClient>,
+    pub storage:   Arc<dyn Storage>,
+    pub llm:       Arc<LiteLlmClient>,
     #[allow(dead_code)] // reserved for per-request config (rate limits, etc.)
-    pub app_cfg: Arc<AppConfig>,
+    pub app_cfg:   Arc<AppConfig>,
+    /// Extra tools loaded at startup (scripted commands + MCP), shared across
+    /// requests.
+    pub extra_tools: Arc<Vec<Arc<dyn Tool>>>,
+    /// Effective agent config (system prompt + skills + iteration cap).
+    pub agent_cfg: AgentConfig,
 }
 
 // ── SSE sender registry (process-global) ─────────────────────────────────────
@@ -67,11 +72,19 @@ async fn sse_senders() -> &'static Mutex<HashMap<Uuid, mpsc::Sender<String>>> {
 // ── router ────────────────────────────────────────────────────────────────────
 
 pub async fn build_router(
-    storage: Arc<dyn Storage>,
-    llm:     Arc<LiteLlmClient>,
-    app_cfg: Arc<AppConfig>,
+    storage:     Arc<dyn Storage>,
+    llm:         Arc<LiteLlmClient>,
+    app_cfg:     Arc<AppConfig>,
+    extra_tools: Vec<Arc<dyn Tool>>,
+    agent_cfg:   AgentConfig,
 ) -> Router {
-    let state = AppState { storage, llm, app_cfg };
+    let state = AppState {
+        storage,
+        llm,
+        app_cfg,
+        extra_tools: Arc::new(extra_tools),
+        agent_cfg,
+    };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -333,10 +346,10 @@ fn make_agent(state: &AppState) -> Agent {
     hooks.add(ToolAnnouncerHook);
     Agent::new(
         Arc::clone(&state.llm),
-        default_registry(Arc::clone(&state.storage)),
+        default_registry_with_mcp(Arc::clone(&state.storage), &state.extra_tools),
         hooks,
         Arc::clone(&state.storage),
-        AgentConfig::default(),
+        state.agent_cfg.clone(),
     )
 }
 

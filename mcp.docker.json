@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "postgres": {
+      "sse_url": "http://postgres-mcp:8000/sse"
+    }
+  }
+}

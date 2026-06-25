@@ -4,6 +4,7 @@
 /// speak plain JSON rather than pulling in a heavy SDK crate.  This keeps the
 /// dependency tree small and makes the serialisation logic trivial to follow.
 use anyhow::Context;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
@@ -147,19 +148,9 @@ struct ChatRequest<'a> {
     tool_choice: Option<&'static str>,
     max_tokens: u32,
     temperature: f32,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ChatResponse {
-    pub choices: Vec<Choice>,
-    pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct Choice {
-    pub message: AssistantMessage,
-    pub finish_reason: Option<String>,
+    /// When true, the gateway streams the response as SSE `data:` chunks.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,11 +163,47 @@ pub struct AssistantMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
+// ── streaming chunk types ─────────────────────────────────────────────────────
+//
+// In stream mode the gateway emits SSE frames `data: {chunk}` where each chunk
+// carries a partial `delta`.  Text arrives token-by-token in `delta.content`;
+// tool calls arrive incrementally, keyed by `index`, with `function.arguments`
+// fragments that must be concatenated.
+
 #[derive(Debug, Deserialize)]
-pub struct Usage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
+struct ChatChunk {
+    #[serde(default)]
+    choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChunkChoice {
+    delta: Delta,
+}
+
+#[derive(Debug, Deserialize)]
+struct Delta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolCallDelta {
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<FunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 // ── client ────────────────────────────────────────────────────────────────────
@@ -232,14 +259,18 @@ impl LiteLlmClient {
         Self { http, config }
     }
 
-    /// Send a chat-completion request and return the model's response.
+    /// Send a chat-completion request, streaming the response token-by-token.
     ///
-    /// `tools` is `None` when we don't want tool-use in a particular call.
-    #[instrument(skip(self, messages, tools), fields(model = %self.config.default_model))]
-    pub async fn chat(
+    /// `on_text` is invoked with each text delta as it arrives.  The fully
+    /// assembled [`AssistantMessage`] (content + any tool calls) is returned
+    /// once the stream completes, so all downstream logic is identical to the
+    /// non-streaming path.
+    #[instrument(skip(self, messages, tools, on_text), fields(model = %self.config.default_model))]
+    pub async fn chat_stream(
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinitionParam]>,
+        mut on_text: impl FnMut(&str),
     ) -> Result<AssistantMessage> {
         let url = format!("{}/chat/completions", self.config.base_url);
 
@@ -250,9 +281,10 @@ impl LiteLlmClient {
             tool_choice: tools.filter(|t| !t.is_empty()).map(|_| "auto"),
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
+            stream: true,
         };
 
-        debug!(messages = messages.len(), "sending chat request");
+        debug!(messages = messages.len(), "sending streaming chat request");
 
         let req = self.http.post(&url);
         let req = if self.config.api_key.is_empty() {
@@ -275,26 +307,131 @@ impl LiteLlmClient {
             )));
         }
 
-        let chat_resp: ChatResponse = resp
-            .json()
-            .await
-            .context("failed to deserialize LiteLLM response")
-            .map_err(|e| AgentError::Inference(e.to_string()))?;
+        let mut acc = StreamAccumulator::default();
+        let mut stream = resp.bytes_stream();
 
-        if let Some(usage) = &chat_resp.usage {
-            debug!(
-                prompt = usage.prompt_tokens,
-                completion = usage.completion_tokens,
-                total = usage.total_tokens,
-                "token usage"
-            );
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .context("error reading streaming response body")
+                .map_err(|e| AgentError::Inference(e.to_string()))?;
+            acc.feed(&String::from_utf8_lossy(&chunk), &mut on_text);
         }
 
-        chat_resp
-            .choices
+        Ok(acc.finish())
+    }
+}
+
+/// Reassembles an OpenAI-style streaming response from raw SSE byte chunks.
+///
+/// Network chunks don't align to SSE event boundaries, so we buffer and split
+/// on `\n\n`.  Text deltas are concatenated; tool calls are accumulated by
+/// their `index`, with `arguments` fragments joined into the full JSON string.
+#[derive(Default)]
+struct StreamAccumulator {
+    buf: String,
+    content: String,
+    tool_acc: Vec<(String, String, String)>, // (id, name, args)
+}
+
+impl StreamAccumulator {
+    /// Feed one network chunk; invoke `on_text` for each new text delta.
+    fn feed(&mut self, bytes: &str, on_text: &mut impl FnMut(&str)) {
+        self.buf.push_str(bytes);
+
+        while let Some(pos) = self.buf.find("\n\n") {
+            let event: String = self.buf.drain(..pos + 2).collect();
+            for line in event.lines() {
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    break;
+                }
+                let parsed: ChatChunk = match serde_json::from_str(data) {
+                    Ok(c) => c,
+                    Err(_) => continue, // skip keep-alives / non-JSON frames
+                };
+                let Some(choice) = parsed.choices.into_iter().next() else {
+                    continue;
+                };
+                if let Some(text) = choice.delta.content {
+                    if !text.is_empty() {
+                        on_text(&text);
+                        self.content.push_str(&text);
+                    }
+                }
+                for tc in choice.delta.tool_calls.into_iter().flatten() {
+                    if self.tool_acc.len() <= tc.index {
+                        self.tool_acc.resize(tc.index + 1, Default::default());
+                    }
+                    let slot = &mut self.tool_acc[tc.index];
+                    if let Some(id) = tc.id {
+                        slot.0 = id;
+                    }
+                    if let Some(f) = tc.function {
+                        if let Some(name) = f.name {
+                            slot.1 = name;
+                        }
+                        if let Some(args) = f.arguments {
+                            slot.2.push_str(&args);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> AssistantMessage {
+        let tool_calls: Vec<ToolCall> = self
+            .tool_acc
             .into_iter()
-            .next()
-            .map(|c| c.message)
-            .ok_or_else(|| AgentError::Inference("empty choices in response".into()))
+            .filter(|(_, name, _)| !name.is_empty())
+            .map(|(id, name, arguments)| ToolCall {
+                id,
+                kind: "function".into(),
+                function: FunctionCall { name, arguments },
+            })
+            .collect();
+
+        AssistantMessage {
+            role: "assistant".into(),
+            content: (!self.content.is_empty()).then_some(self.content),
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accumulates_split_frames_and_tool_args() {
+        let mut acc = StreamAccumulator::default();
+        let mut text = String::new();
+        let mut sink = |s: &str| text.push_str(s);
+
+        // Stream split mid-frame across chunk boundaries, with a tool call whose
+        // JSON arguments arrive in fragments and a trailing keep-alive + [DONE].
+        let chunks = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel",
+            "lo\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"p\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"x\\\"}\"}}]}}]}\n\n",
+            ": keep-alive\n\ndata: [DONE]\n\n",
+        ];
+        for c in chunks {
+            acc.feed(c, &mut sink);
+        }
+
+        assert_eq!(text, "Hello world");
+        let msg = acc.finish();
+        assert_eq!(msg.content.as_deref(), Some("Hello world"));
+        let tcs = msg.tool_calls.expect("tool calls");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].id, "call_1");
+        assert_eq!(tcs[0].function.name, "read");
+        assert_eq!(tcs[0].function.arguments, r#"{"p":"x"}"#);
     }
 }

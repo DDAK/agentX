@@ -63,20 +63,26 @@ pub enum AgentEvent {
 
 // ── configuration ─────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// Maximum tool-call iterations per user turn.
     pub max_iterations: usize,
+    /// System prompt injected on fresh sessions.
+    pub system_prompt: String,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { max_iterations: 32 }
+        Self {
+            max_iterations: 32,
+            system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
+        }
     }
 }
 
 // ── system prompt ─────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT: &str = "\
+pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are AgentX, an expert software engineering assistant.
 You have access to tools that let you read, write, and edit files on the local \
 filesystem, list directory contents, and run shell commands.
@@ -127,7 +133,7 @@ impl Agent {
         if session.messages.is_empty() {
             session.messages.push(Message {
                 role: MessageRole::System,
-                content: MessageContent::Text(SYSTEM_PROMPT.into()),
+                content: MessageContent::Text(self.config.system_prompt.clone()),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -193,19 +199,18 @@ impl Agent {
 
             debug!(iteration = iterations, "calling LLM");
 
-            let response = self.llm.chat(&session.messages, Some(tool_defs)).await?;
+            // Stream the response: each text delta is broadcast as it arrives.
+            let response = self
+                .llm
+                .chat_stream(&session.messages, Some(tool_defs), |delta| {
+                    let _ = tx_out.send(AgentEvent::Text { text: delta.to_owned() });
+                })
+                .await?;
 
             self.hooks.fire(&HookEvent::AfterInference {
                 content: response.content.clone(),
                 tool_call_count: response.tool_calls.as_ref().map(|v| v.len()).unwrap_or(0),
             }).await;
-
-            // Emit any text the model produced.
-            if let Some(ref text) = response.content {
-                if !text.is_empty() {
-                    let _ = tx_out.send(AgentEvent::Text { text: text.clone() });
-                }
-            }
 
             // No tool calls → turn is done.
             let Some(tool_calls) = response.tool_calls else {

@@ -19,6 +19,11 @@
 /// | `edit_file`   | `async def edit_file(path: str, old_str: str, new_str: str) -> str` |
 /// | `list_files`  | `async def list_files(path: str = ".") -> list`            |
 /// | `run_command` | `async def run_command(command: str) -> str`               |
+/// | `call_tool`   | `async def call_tool(name: str, **kwargs) -> str`          |
+///
+/// `call_tool` is the generic escape hatch for MCP tools (whose names contain
+/// `__` and so can't be called as bare Python identifiers):
+/// `await call_tool("mcp__server__search", query="rust")`.
 ///
 /// ## Resource limits
 ///
@@ -87,7 +92,9 @@ impl Tool for RunCodeTool {
          - write_file(path, content)          → str\n\
          - edit_file(path, old_str, new_str)  → str\n\
          - list_files(path='.')               → list\n\
-         - run_command(command)               → str\n\n\
+         - run_command(command)               → str\n\
+         - call_tool(name, **kwargs)          → str  (invoke an MCP tool, e.g.\n\
+           call_tool('mcp__server__search', query='rust'))\n\n\
          Use run_code when a task benefits from expressing logic as a program — \
          loops, conditionals, aggregation across many files — rather than issuing \
          sequential individual tool calls. \
@@ -177,9 +184,9 @@ fn run_in_sandbox(code: &str, registry: &ToolRegistry) -> Result<String> {
                 let call_id = call.call_id;
                 debug!(function = %fn_name, call_id, "sandbox → host dispatch");
 
-                let ext_result = match build_tool_input(&fn_name, &call.args, &call.kwargs) {
-                    Ok(tool_input) => {
-                        match rt.block_on(registry.execute(&fn_name, tool_input)) {
+                let ext_result = match build_tool_input(registry, &fn_name, &call.args, &call.kwargs) {
+                    Ok((tool_name, tool_input)) => {
+                        match rt.block_on(registry.execute(&tool_name, tool_input)) {
                             Ok(result) => ExtFunctionResult::Return(MontyObject::String(result)),
                             Err(e) => {
                                 warn!(tool = %fn_name, error = %e, "host tool returned error");
@@ -216,7 +223,7 @@ fn run_in_sandbox(code: &str, registry: &ToolRegistry) -> Result<String> {
                 // name. We return a Function object for known host names;
                 // the actual dispatch happens when Monty issues FunctionCall.
                 let name = lookup.name.clone();
-                let result = if is_host_function(&name) {
+                let result = if is_host_function(registry, &name) {
                     NameLookupResult::Value(MontyObject::Function {
                         name: name.clone(),
                         docstring: None,
@@ -269,21 +276,27 @@ fn run_in_sandbox(code: &str, registry: &ToolRegistry) -> Result<String> {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Names of the host functions the sandbox may call.
-const HOST_FUNCTIONS: &[&str] =
-    &["read_file", "write_file", "edit_file", "list_files", "run_command"];
-
-fn is_host_function(name: &str) -> bool {
-    HOST_FUNCTIONS.contains(&name)
+/// A name is callable from the sandbox if it's a registered tool — the
+/// built-ins or any MCP tool (e.g. `mcp__server__search`). Python identifiers
+/// can't contain `__`-prefixed server names as bare calls, so MCP tools are
+/// reached via `call_tool(name, **kwargs)`; see [`build_tool_input`].
+fn is_host_function(registry: &ToolRegistry, name: &str) -> bool {
+    name == "call_tool" || registry.contains(name)
 }
 
 /// Convert positional + keyword arguments from a Monty `FunctionCall` into the
 /// `serde_json::Value` that `ToolRegistry::execute` expects.
+///
+/// Built-ins map positional args by their known signature. MCP tools have
+/// arbitrary schemas, so they're invoked generically through `call_tool`:
+/// `call_tool("mcp__server__tool", arg1=..., arg2=...)` — the kwargs become
+/// the tool's JSON arguments object. Returns the resolved tool name and input.
 fn build_tool_input(
+    registry: &ToolRegistry,
     fn_name: &str,
     args: &[MontyObject],
     kwargs: &[(MontyObject, MontyObject)],
-) -> std::result::Result<Value, String> {
+) -> std::result::Result<(String, Value), String> {
     // Collect keyword arguments into a string-keyed map.
     let mut kw: HashMap<String, &MontyObject> = HashMap::new();
     for (k, v) in kwargs {
@@ -301,14 +314,14 @@ fn build_tool_input(
         "read_file" => {
             let path = positional_or_kw(args, 0, "path", &kw)
                 .ok_or("read_file requires 'path'")?;
-            Ok(json!({ "path": as_str(path)? }))
+            Ok((fn_name.into(), json!({ "path": as_str(path)? })))
         }
         "write_file" => {
             let path = positional_or_kw(args, 0, "path", &kw)
                 .ok_or("write_file requires 'path'")?;
             let content = positional_or_kw(args, 1, "content", &kw)
                 .ok_or("write_file requires 'content'")?;
-            Ok(json!({ "path": as_str(path)?, "content": as_str(content)? }))
+            Ok((fn_name.into(), json!({ "path": as_str(path)?, "content": as_str(content)? })))
         }
         "edit_file" => {
             let path = positional_or_kw(args, 0, "path", &kw)
@@ -317,23 +330,42 @@ fn build_tool_input(
                 .ok_or("edit_file requires 'old_str'")?;
             let new = positional_or_kw(args, 2, "new_str", &kw)
                 .ok_or("edit_file requires 'new_str'")?;
-            Ok(json!({
+            Ok((fn_name.into(), json!({
                 "path":    as_str(path)?,
                 "old_str": as_str(old)?,
                 "new_str": as_str(new)?,
-            }))
+            })))
         }
         "list_files" => {
             let path = positional_or_kw(args, 0, "path", &kw)
                 .map(|obj| as_str(obj))
                 .transpose()?
                 .unwrap_or_else(|| ".".to_owned());
-            Ok(json!({ "path": path }))
+            Ok((fn_name.into(), json!({ "path": path })))
         }
         "run_command" => {
             let command = positional_or_kw(args, 0, "command", &kw)
                 .ok_or("run_command requires 'command'")?;
-            Ok(json!({ "command": as_str(command)? }))
+            Ok((fn_name.into(), json!({ "command": as_str(command)? })))
+        }
+        // Generic dispatch to any registered tool (MCP tools):
+        //   call_tool("mcp__server__tool", key=value, ...)
+        "call_tool" => {
+            let name = positional_or_kw(args, 0, "name", &kw)
+                .ok_or("call_tool requires the tool name as its first argument")?;
+            let name = as_str(name)?;
+            if !registry.contains(&name) {
+                return Err(format!("call_tool: unknown tool '{name}'"));
+            }
+            // All keyword args except `name` form the tool's arguments object.
+            let mut obj = serde_json::Map::new();
+            for (k, v) in &kw {
+                if *k == "name" {
+                    continue;
+                }
+                obj.insert((*k).clone(), monty_to_json(v));
+            }
+            Ok((name, Value::Object(obj)))
         }
         other => Err(format!("unknown host function '{other}'")),
     }
@@ -375,6 +407,33 @@ fn monty_to_string(obj: &MontyObject) -> String {
         }
         MontyObject::Bytes(b) => format!("<bytes len={}>", b.len()),
         _ => format!("{obj:?}"),
+    }
+}
+
+/// Convert a `MontyObject` into a JSON value, preserving types. Used to build
+/// MCP tool argument objects, whose schemas accept more than just strings.
+fn monty_to_json(obj: &MontyObject) -> Value {
+    match obj {
+        MontyObject::None => Value::Null,
+        MontyObject::Bool(b) => Value::Bool(*b),
+        MontyObject::Int(n) => Value::from(*n),
+        MontyObject::BigInt(n) => Value::from(n.to_string()),
+        MontyObject::Float(f) => {
+            serde_json::Number::from_f64(*f).map(Value::Number).unwrap_or(Value::Null)
+        }
+        MontyObject::String(s) => Value::String(s.clone()),
+        MontyObject::List(items) | MontyObject::Tuple(items) => {
+            Value::Array(items.iter().map(monty_to_json).collect())
+        }
+        MontyObject::Dict(pairs) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in pairs {
+                // JSON object keys must be strings; render the key as one.
+                map.insert(monty_to_string(k), monty_to_json(v));
+            }
+            Value::Object(map)
+        }
+        other => Value::String(format!("{other:?}")),
     }
 }
 

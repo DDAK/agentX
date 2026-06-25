@@ -56,28 +56,31 @@ Most AI coding agents are Python wrappers around a single LLM. AgentX is differe
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                                                                          │
-│  ┌──────────┐         WebSocket / SSE          ┌─────────────────────┐  │
-│  │ Frontend │ ◄──────────────────────────────► │  AgentX API Server  │  │
-│  │ (Vite)   │          :3000                   │  (Rust/Axum) :8080  │  │
-│  └──────────┘                                  └─────────┬───────────┘  │
-│                                                          │              │
-│                                              ┌───────────┴───────────┐  │
-│                                              │                       │  │
-│                                    ┌─────────▼─────────┐   ┌────────▼──┐
-│                                    │  LiteLLM Gateway   │   │  Storage  │
-│                                    │  :4000             │   │           │
-│                                    └─────────┬─────────┘   │ • FS      │
-│                                              │             │ • Postgres │
-│                              ┌───────────────┼─────────┐   └───────────┘
-│                              │               │         │                │
-│                      ┌───────▼───┐  ┌────────▼──┐ ┌────▼────┐          │
-│                      │ Anthropic │  │  OpenAI   │ │ Gemini  │          │
-│                      │  Claude   │  │  GPT-4o   │ │  Flash  │          │
-│                      └───────────┘  └───────────┘ └─────────┘          │
-│                                                                          │
-└──────────────────────────────────────────────────────────────────────────┘
+┌───────────┐    WebSocket / SSE (token-streamed)    ┌──────────────────────┐
+│ Frontend  │ ◄────────────────────────────────────► │  AgentX API Server   │
+│ (Vite)    │                 :3000                  │  (Rust / Axum) :8080 │
+└───────────┘                                        └──────────┬───────────┘
+                                                                │
+        ┌───────────────────────────┬───────────────────────────┼───────────────────────────┐
+        │                           │                           │                           │
+        ▼                           ▼                           ▼                           ▼
+┌───────────────┐         ┌───────────────────┐       ┌──────────────────┐        ┌─────────────────┐
+│  Storage      │         │  LiteLLM Gateway  │       │  Tool Registry   │        │ Dynamic         │
+│               │         │  (shared:         │       │                  │        │ Extensions      │
+│ • Filesystem  │         │   atom-litellm)   │       │ • 5 built-ins    │        │ (AGENTX_HOME,   │
+│ • Postgres    │         │  stream: true     │       │ • run_code       │        │  loaded @ start)│
+└───────────────┘         └─────────┬─────────┘       │ • MCP tools      │        │                 │
+                                    │                 │ • Rhai commands  │        │ • config.yaml   │
+                          ┌─────────┼─────────┐       └────────┬─────────┘        │ • skills/*.md   │
+                          ▼         ▼         ▼                │                  │ • commands/*.rhai│
+                    ┌─────────┐ ┌────────┐ ┌────────┐          │                  └────────┬────────┘
+                    │ Claude  │ │ OpenAI │ │ Gemini │          │                           │
+                    │ (Haiku/ │ │ GPT-4o │ │ Flash  │          ▼                  (feeds prompt + tools)
+                    │  Opus)  │ │        │ │        │   ┌───────────────────┐
+                    └─────────┘ └────────┘ └────────┘   │  MCP Servers      │
+                                                        │ stdio / HTTP / SSE│
+                                                        │ e.g. postgres-mcp │
+                                                        └───────────────────┘
 ```
 
 ### Component Overview
@@ -85,10 +88,12 @@ Most AI coding agents are Python wrappers around a single LLM. AgentX is differe
 | Component | Responsibility |
 |-----------|---------------|
 | **`agent.rs`** | Core agentic loop — channel-driven, headless. Receives user messages, calls LLM, dispatches tools, emits typed events. |
-| **`api.rs`** | Axum HTTP server — REST endpoints, WebSocket upgrades, SSE streams. |
-| **`llm.rs`** | LiteLLM gateway client — OpenAI-compatible chat completions, no SDK bloat. |
-| **`tools.rs`** | Tool trait + registry. Five built-in tools + extensible registration. |
-| **`code_tool.rs`** | Sandboxed Python execution via Monty — lets the agent write programs that call tools. |
+| **`api.rs`** | Axum HTTP server — REST endpoints, WebSocket upgrades, token-streamed SSE. |
+| **`llm.rs`** | LiteLLM gateway client — OpenAI-compatible chat completions with `stream: true`, parsed token-by-token. No SDK bloat. |
+| **`tools.rs`** | Tool trait + registry. Built-ins + MCP tools + Rhai commands, all behind one trait. |
+| **`mcp.rs`** | Model Context Protocol client — connects external tool servers over stdio, HTTP, or SSE; each remote tool becomes a native `Tool`. |
+| **`scripting.rs`** | Dynamic extensions — loads `config.yaml`, `skills/*.md`, and Rhai `commands/*.rhai` from disk at startup. |
+| **`code_tool.rs`** | Sandboxed Python execution via Monty — lets the agent write programs that call tools (incl. MCP via `call_tool`). |
 | **`hooks.rs`** | Hook chain for lifecycle events. Built-in: logging, tool announcer, command confirmation. |
 | **`storage.rs`** | Storage trait + FilesystemStorage + PostgresStorage with session CRUD. |
 | **`config.rs`** | Environment-based configuration with sensible defaults. |
@@ -104,11 +109,13 @@ User Message
 │                                             │
 │  1. Append user message to conversation     │
 │  2. Emit AgentEvent::Thinking               │
-│  3. Call LLM with conversation + tool defs  │
-│  4. If text response → emit Text, done      │
+│  3. Stream LLM completion (conversation +   │
+│     tool defs); emit each token as Text     │
+│  4. If no tool_calls → done                 │
 │  5. If tool_calls:                          │
 │     a. Fire BeforeToolExecution hook         │
 │     b. Execute tool via ToolRegistry         │
+│        (built-in / MCP / Rhai — same path)   │
 │     c. Append result to conversation         │
 │     d. Fire AfterToolExecution hook          │
 │     e. Loop back to step 3                  │
@@ -116,6 +123,19 @@ User Message
 │  7. Persist session to storage              │
 └─────────────────────────────────────────────┘
 ```
+
+### Recent Architectural Changes — What & Why
+
+The diagram above reflects four changes layered onto the original design. Each was added without disturbing the core agent loop, because the loop only ever talks to a `Tool` trait and a streaming LLM client — extension points, not hard-coded lists.
+
+| Change | What it adds | Why it matters |
+|--------|-------------|----------------|
+| **Token streaming** (`llm.rs`, `api.rs`) | `stream: true` to the gateway, parsed token-by-token and pushed out over SSE as `Text` events as they arrive. | Users see output immediately instead of waiting for the full completion — the difference between a tool that feels live and one that feels hung on long answers. |
+| **MCP tool servers** (`mcp.rs`) | External tool servers over stdio, HTTP, or SSE. Each remote tool is wrapped as a native `Tool` (`mcp__<server>__<tool>`). | Capabilities can be added by pointing at a server — no code change. The Postgres MCP server, for example, gives the agent 9 database tools for free. |
+| **Shared LiteLLM gateway** (`docker-compose.yml`) | The bundled local gateway was dropped; the agent now uses a shared external gateway (e.g. `atom-litellm`) on the LLM network. | One gateway, one set of keys and budgets across services — no duplicated config, no second container to keep in sync. (The old service is preserved as a comment for rollback.) |
+| **Dynamic extensions** (`scripting.rs`) | `config.yaml` (behaviour), `skills/*.md` (prompt fragments), and Rhai `commands/*.rhai` (scripted tools), all loaded from `AGENTX_HOME` at startup. | Behaviour, knowledge, and new commands change by editing files and restarting — **no recompile, no rebuild**. The binary stays generic; deployments specialise it on disk. |
+
+The unifying principle: **everything dynamic lives behind a trait or on disk.** New tools (MCP, Rhai), new behaviour (YAML/MD), and incremental output (streaming) all plug into seams the agent loop already exposes, so the hot path never had to change.
 
 ---
 
@@ -200,6 +220,7 @@ npm run dev
 | `STORAGE_BACKEND` | `filesystem` | `filesystem` or `postgres` |
 | `WORKSPACE_DIR` | `.` | Root for file tool operations |
 | `CONFIRM_COMMANDS` | `false` | Require y/N before `run_command` (CLI only) |
+| `AGENTX_HOME` | `agentx.d` | Dynamic extensions dir (see [Dynamic Extensions](#dynamic-extensions)) |
 | `RUST_LOG` | `agentx=info,warn` | Tracing filter |
 
 ### LLM Configuration
@@ -211,6 +232,7 @@ npm run dev
 | `AGENT_MODEL` | `claude-3-7-sonnet-20250219` | Model name from `litellm_config.yaml` |
 | `AGENT_MAX_TOKENS` | `8192` | Max tokens per response |
 | `AGENT_TEMPERATURE` | `0.0` | Sampling temperature |
+| `MCP_CONFIG` | `.mcp.json` | Path to the MCP server config (see [MCP Tool Servers](#mcp-tool-servers)) |
 
 ### Provider Keys
 
@@ -303,6 +325,89 @@ for f in files:
 - No direct OS/filesystem access — must use host functions
 - Hook chain applies to all tool calls from within the sandbox
 
+### MCP Tool Servers
+
+AgentX can pull in tools from external [Model Context Protocol](https://modelcontextprotocol.io) servers over two transports: **stdio** (a `command` launches a local subprocess) and **HTTP** (a `url` for a remote/hosted server). Drop a `.mcp.json` in the working directory (or point `MCP_CONFIG` at one):
+
+```json
+{
+  "mcpServers": {
+    "everything": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "env": {}
+    },
+    "remote": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+On startup AgentX connects each server, performs the MCP handshake, and registers its tools alongside the built-ins. Discovered tools are namespaced `mcp__<server>__<tool>` so two servers can expose the same tool name without colliding. A server that fails to start is logged and skipped — it never takes down the agent. MCP is fully opt-in: with no config file, nothing is spawned. The hook chain applies to MCP tool calls just like built-ins.
+
+Requests are dispatched **concurrently** — each carries a unique JSON-RPC id, and stdio responses are routed back to the awaiting caller by id, so a slow call never blocks a fast one.
+
+MCP tools are also reachable from inside the `run_code` sandbox via the generic `call_tool` host function:
+
+```python
+results = await call_tool("mcp__everything__search", query="rust")
+```
+
+---
+
+## Dynamic Extensions
+
+Configuration, skills, and commands live on disk under `AGENTX_HOME` (default `./agentx.d`) and are loaded at startup — add, change, or remove them and **restart**; no recompile, no rebuild.
+
+```text
+agentx.d/
+  config.yaml        agent behaviour (system prompt, iteration cap)
+  skills/*.md        prompt fragments appended to the system prompt
+  commands/*.rhai    scripted tools the model can call
+```
+
+Everything is optional: a missing dir or file just falls back to built-in defaults.
+
+### Config — `config.yaml`
+
+```yaml
+system_prompt: |
+  You are AgentX, an expert software engineering assistant.
+max_iterations: 32
+```
+
+Deployment settings (gateway URL, keys, storage) stay as environment variables — only agent *behaviour* lives here.
+
+### Skills — `skills/*.md`
+
+Each Markdown file is appended to the system prompt (sorted by filename) under a `# Skills` heading. Use them to teach the agent project conventions, workflows, or domain knowledge — just drop in a `.md` file.
+
+### Commands — `commands/*.rhai`
+
+Each [Rhai](https://rhai.rs) script becomes a tool named after the file. This is the part that genuinely needs a scripting engine: dynamic *behaviour* that would otherwise require a recompile.
+
+```rust
+// commands/word_count.rhai → tool "word_count"
+fn meta() {
+    #{ description: "Count the words in a workspace file.",
+       parameters: #{ type: "object",
+                      properties: #{ path: #{ type: "string" } },
+                      required: ["path"] } }
+}
+fn run(input) {
+    let text = read_file(input.path);
+    "" + text.split(' ').len + " words in " + input.path
+}
+```
+
+- `run(input)` — entry point; `input` is a map of the model's arguments, the return value (stringified) is the tool result. **Required.**
+- `meta()` — returns `#{ description, parameters }` describing the tool to the model. Optional.
+- Host functions, all scoped to the workspace dir: `read_file(path)`, `write_file(path, content)`, `list_files(path)`, `sh(cmd)`.
+
+A script that fails to compile is logged and skipped — one broken command never takes the agent down.
+
 ---
 
 ## Extending AgentX
@@ -394,6 +499,8 @@ agentx/
 │   ├── api.rs           Axum HTTP server (WebSocket + SSE + REST)
 │   ├── llm.rs           LiteLLM gateway client
 │   ├── tools.rs         Tool trait + registry + 5 built-in tools
+│   ├── mcp.rs           MCP (Model Context Protocol) stdio client
+│   ├── scripting.rs     Dynamic extensions — YAML config, MD skills, Rhai commands
 │   ├── code_tool.rs     Sandboxed Python execution (Monty)
 │   ├── hooks.rs         Hook system (logging, confirmation, extensible)
 │   ├── storage.rs       Storage trait + Filesystem + Postgres backends
@@ -436,14 +543,15 @@ agentx/
 
 ## Roadmap
 
-- [ ] Streaming token output (SSE chunked)
-- [ ] MCP (Model Context Protocol) tool server support
+- [x] Streaming token output (SSE chunked)
+- [x] MCP (Model Context Protocol) tool server support (stdio + HTTP + SSE transports)
+- [x] Dynamic extensions — YAML config, Markdown skills, Rhai scripted commands (no recompile)
 - [ ] Multi-agent orchestration (supervisor + worker pattern)
 - [ ] Git integration tool (diff, commit, branch)
 - [ ] VS Code extension
 - [ ] OpenTelemetry tracing export
 - [ ] Rate limiting + usage tracking per session
-- [ ] Plugin system (WASM-based tool loading)
+- [x] Plugin system — Rhai-scripted commands loaded from disk (see [Dynamic Extensions](#dynamic-extensions))
 
 ---
 

@@ -9,9 +9,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agentx::code_tool::RunCodeTool;
+use agentx::errors::Result;
 use agentx::storage::{FilesystemStorage, Storage};
-use agentx::tools::{Tool, ToolRegistry, default_registry};
-use serde_json::json;
+use agentx::tools::{default_registry, default_registry_with_mcp, Tool, ToolRegistry};
+use async_trait::async_trait;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -231,4 +233,53 @@ async fn test_missing_code_field_returns_error() {
     let err = tool.execute(json!({})).await.unwrap_err();
     assert!(err.to_string().contains("code") || err.to_string().contains("missing"),
         "got: {err}");
+}
+
+// ── MCP tools reachable from the sandbox via call_tool ────────────────────────
+
+/// A stub tool standing in for an MCP-provided tool. Echoes its `query` arg
+/// back so the test can assert the kwargs reached it.
+struct StubMcpTool;
+
+#[async_trait]
+impl Tool for StubMcpTool {
+    fn name(&self) -> &str {
+        "mcp__demo__echo"
+    }
+    fn description(&self) -> &str {
+        "echoes its query argument"
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({ "type": "object", "properties": { "query": { "type": "string" } } })
+    }
+    async fn execute(&self, input: Value) -> Result<String> {
+        Ok(format!("echo: {}", input.get("query").and_then(|q| q.as_str()).unwrap_or("")))
+    }
+}
+
+#[tokio::test]
+async fn test_sandbox_can_call_mcp_tool() {
+    let dir = TempDir::new().unwrap();
+    let storage: Arc<dyn Storage> =
+        Arc::new(FilesystemStorage::new(dir.path()).await.unwrap());
+    let extra: Vec<Arc<dyn Tool>> = vec![Arc::new(StubMcpTool)];
+    let registry = default_registry_with_mcp(Arc::clone(&storage), &extra);
+
+    // The script reaches the MCP tool through the generic call_tool host fn.
+    let output = run(
+        registry,
+        r#"
+result = await call_tool("mcp__demo__echo", query="hello from python")
+result
+"#,
+    )
+    .await;
+    assert_eq!(output, "echo: hello from python");
+}
+
+#[tokio::test]
+async fn test_sandbox_call_tool_unknown_tool_errors() {
+    let (_dir, _storage, registry) = setup().await;
+    let err = run_err(registry, r#"await call_tool("mcp__nope__missing", x=1)"#).await;
+    assert!(err.contains("unknown tool") || err.contains("nope"), "got: {err}");
 }

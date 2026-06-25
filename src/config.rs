@@ -40,11 +40,15 @@ impl AppConfig {
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
 
+        // Treat empty env vars as absent — a blank `RESUME_SESSION=` in .env
+        // should mean "no session", not an empty (invalid) UUID.
+        let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+
         Ok(Self {
             storage_backend,
             workspace_dir,
-            session_label: std::env::var("SESSION_LABEL").ok(),
-            resume_session: std::env::var("RESUME_SESSION").ok(),
+            session_label: non_empty("SESSION_LABEL"),
+            resume_session: non_empty("RESUME_SESSION"),
             confirm_commands,
         })
     }

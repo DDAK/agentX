@@ -6,5 +6,7 @@ pub mod config;
 pub mod errors;
 pub mod hooks;
 pub mod llm;
+pub mod mcp;
+pub mod scripting;
 pub mod storage;
 pub mod tools;

@@ -35,6 +35,9 @@ pub enum AgentError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    #[error("MCP error: {0}")]
+    Mcp(String),
 }
 
 /// Convenience alias — most functions return this.

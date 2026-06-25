@@ -9,6 +9,7 @@
 /// Run with:  cargo test --test api_test
 use std::sync::Arc;
 
+use agentx::agent::AgentConfig;
 use agentx::api::build_router;
 use agentx::config::AppConfig;
 use agentx::llm::{LiteLlmClient, LiteLlmConfig};
@@ -52,7 +53,7 @@ async fn router_with_storage(
         resume_session:   None,
         confirm_commands: false,
     });
-    let router = build_router(storage, llm, Arc::clone(&app_cfg)).await;
+    let router = build_router(storage, llm, Arc::clone(&app_cfg), vec![], AgentConfig::default()).await;
     (router, app_cfg)
 }
 

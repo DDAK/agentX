@@ -2,27 +2,31 @@ name: agentx
 
 services:
 
-  # ── LiteLLM gateway ─────────────────────────────────────────────────────────
-  litellm:
-    image: ghcr.io/berriai/litellm:main-v1.63.14-stable
-    container_name: agentx-litellm
-    restart: unless-stopped
-    ports:
-      - "4000:4000"
-    volumes:
-      - ./litellm_config.yaml:/app/config.yaml:ro
-    environment:
-      ANTHROPIC_API_KEY:  ${ANTHROPIC_API_KEY:-}
-      OPENAI_API_KEY:     ${OPENAI_API_KEY:-}
-      GEMINI_API_KEY:     ${GEMINI_API_KEY:-}
-    command: ["--config", "/app/config.yaml", "--port", "4000"]
-    healthcheck:
-      test: ["CMD", "python3", "-c",
-             "import urllib.request; req=urllib.request.Request('http://localhost:4000/health/liveliness'); urllib.request.urlopen(req)"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
+  # ── REMOVED: local LiteLLM gateway ──────────────────────────────────────────
+  # The agent now uses a shared external LiteLLM gateway on the LLM network
+  # (see the agent service's LITELLM_* env below), so this self-hosted gateway
+  # was removed. Kept here, commented, for history / easy rollback.
+  #
+  # litellm:
+  #   image: ghcr.io/berriai/litellm:main-v1.63.14-stable
+  #   container_name: agentx-litellm
+  #   restart: unless-stopped
+  #   ports:
+  #     - "4000:4000"
+  #   volumes:
+  #     - ./litellm_config.yaml:/app/config.yaml:ro
+  #   environment:
+  #     ANTHROPIC_API_KEY:  ${ANTHROPIC_API_KEY:-}
+  #     OPENAI_API_KEY:     ${OPENAI_API_KEY:-}
+  #     GEMINI_API_KEY:     ${GEMINI_API_KEY:-}
+  #   command: ["--config", "/app/config.yaml", "--port", "4000"]
+  #   healthcheck:
+  #     test: ["CMD", "python3", "-c",
+  #            "import urllib.request; req=urllib.request.Request('http://localhost:4000/health/liveliness'); urllib.request.urlopen(req)"]
+  #     interval: 15s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 20s
 
   # ── Postgres — only started when STORAGE_BACKEND=postgres ──────────────────
   postgres:
@@ -44,6 +48,29 @@ services:
       timeout: 3s
       retries: 10
 
+  # ── postgres-mcp — MCP tool server, reached by the agent over HTTP+SSE ──────
+  postgres-mcp:
+    image: crystaldba/postgres-mcp
+    container_name: agentx-postgres-mcp
+    restart: unless-stopped
+    networks:
+      - default
+      - llm_net
+    environment:
+      DATABASE_URI: ${MCP_PG_DATABASE_URI:?set MCP_PG_DATABASE_URI in .env}
+    command:
+      - "--access-mode=unrestricted"
+      - "--transport=sse"
+      - "--sse-host=0.0.0.0"
+      - "--sse-port=8000"
+    healthcheck:
+      # The image has Python; probe the SSE port directly.
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('localhost',8000))==0 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
   # ── AgentX API server ───────────────────────────────────────────────────────
   agent:
     build:
@@ -52,25 +79,45 @@ services:
     container_name: agentx-agent
     restart: unless-stopped
     depends_on:
-      litellm:
+      # REMOVED: `litellm: { condition: service_healthy }` — the local gateway
+      # is gone; the agent now talks to the external shared LiteLLM gateway.
+      postgres-mcp:
         condition: service_healthy
     ports:
       - "8080:8080"
+    networks:
+      - default
+      - llm_net
     volumes:
       - ${WORKSPACE_DIR:-./workspace}:/workspace
+      # MCP server list for the container (uses sse_url → no secrets inside).
+      - ./mcp.docker.json:/etc/agentx/mcp.json:ro
+      # Dynamic extensions (config.yaml, skills/*.md, commands/*.rhai) — edit on
+      # the host and restart the container to apply, no rebuild.
+      - ./agentx.d:/etc/agentx/agentx.d:ro
     environment:
       AGENTX_MODE:      serve
       BIND_ADDR:        0.0.0.0:8080
+      MCP_CONFIG:       /etc/agentx/mcp.json
+      AGENTX_HOME:      /etc/agentx/agentx.d
 
       # Storage — reads from .env; defaults to filesystem
       STORAGE_BACKEND:  ${STORAGE_BACKEND:-filesystem}
       DATABASE_URL:     postgres://agentx:${POSTGRES_PASSWORD:-agentx_dev}@postgres:5432/agentx
       WORKSPACE_DIR:    /workspace
 
-      # LiteLLM — internal Docker network URL (no auth on internal network)
-      LITELLM_BASE_URL: http://litellm:4000
-      LITELLM_API_KEY:  ""
-      AGENT_MODEL:      ${AGENT_MODEL:-gemini/gemini-2.5-flash}
+      # LiteLLM — a shared external gateway on the LLM network. The real
+      # service/network names are deployment-specific and live in .env (which
+      # is gitignored); committed defaults are generic placeholders. Dedicated
+      # LITELLM_GW_* var names are used (not LITELLM_BASE_URL) so the host CLI's
+      # own .env values can't leak in and point the container at localhost.
+      # The three lines below replaced the old local-gateway settings:
+      #   LITELLM_BASE_URL: http://litellm:4000   (pointed at the removed service)
+      #   LITELLM_API_KEY:  ""                     (no auth on internal network)
+      #   AGENT_MODEL:      ${AGENT_MODEL:-gemini/gemini-2.5-flash}
+      LITELLM_BASE_URL: ${LITELLM_GW_URL:-http://atom-litellm:4000}  # ADDED: shared gateway
+      LITELLM_API_KEY:  ${LITELLM_GW_KEY:-sk-atom-litellm}           # ADDED: gateway master key
+      AGENT_MODEL:      ${LITELLM_GW_MODEL:-claude-haiku-4-5-20251001}  # ADDED: model on the gateway
       AGENT_MAX_TOKENS: ${AGENT_MAX_TOKENS:-8192}
       AGENT_TEMPERATURE: ${AGENT_TEMPERATURE:-0.0}
 
@@ -94,6 +141,14 @@ services:
         condition: service_healthy
     ports:
       - "3030:3030"
+
+networks:
+  # External network hosting the shared LiteLLM gateway + Postgres. Its real
+  # name is deployment-specific — set LLM_NETWORK in .env (gitignored); the
+  # committed default is a generic placeholder.
+  llm_net:
+    external: true
+    name: ${LLM_NETWORK:-atom_network}
 
 volumes:
   postgres_data:
